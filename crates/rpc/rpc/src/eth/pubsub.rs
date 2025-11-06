@@ -1,33 +1,49 @@
 //! `eth_` `PubSub` RPC handler implementation
 
-use std::sync::Arc;
-
-use alloy_primitives::{TxHash, U256};
+use std::{collections::HashMap, sync::Arc};
+use alloy_consensus::{transaction::Recovered, Transaction};
+use alloy_eips::Typed2718;
+use alloy_primitives::{b256, uint, Address, TxHash, B256, U256};
 use alloy_rpc_types_eth::{
     pubsub::{Params, PubSubSyncStatus, SubscriptionKind, SyncStatusMetadata},
-    Filter, Header, Log,
+    BlockId, BlockNumberOrTag, Filter, Header, Log,
 };
 use futures::StreamExt;
 use jsonrpsee::{
     server::SubscriptionMessage, types::ErrorObject, PendingSubscriptionSink, SubscriptionSink,
 };
 use reth_chain_state::CanonStateSubscriptions;
+use reth_evm::{ConfigureEvm, Evm};
 use reth_network_api::NetworkInfo;
-use reth_primitives_traits::NodePrimitives;
+use reth_primitives_traits::{NodePrimitives, SignedTransaction, TxTy};
+use reth_revm::{database::StateProviderDatabase, db::CacheDB};
 use reth_rpc_eth_api::{
-    pubsub::EthPubSubApiServer, EthApiTypes, RpcConvert, RpcNodeCore, RpcTransaction,
+    helpers::Call, pubsub::EthPubSubApiServer, EthApiTypes, FromEvmError, RpcConvert, RpcNodeCore,
+    RpcTransaction,
 };
 use reth_rpc_eth_types::logs_utils;
 use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
 use reth_storage_api::BlockNumReader;
 use reth_tasks::{TaskSpawner, TokioTaskExecutor};
 use reth_transaction_pool::{NewTransactionEvent, PoolConsensusTx, TransactionPool};
+use revm::{context::result::ResultAndState, context_interface::result::ExecutionResult};
 use serde::Serialize;
 use tokio_stream::{
     wrappers::{BroadcastStream, ReceiverStream},
     Stream,
 };
 use tracing::error;
+
+const UNISWAP_V2_SYNC_TOPIC: B256 =
+    b256!("0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1");
+const UNISWAP_V3_SWAP_TOPIC: B256 =
+    b256!("0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67");
+const PANCAKE_V3_SWAP_TOPIC: B256 =
+    b256!("0x19b47279256b2a23a1665c810c8d55a1758940ee09377d4f8d26497a3577dc83");
+const UNISWAP_V4_SWAP_TOPIC: B256 =
+    b256!("0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad7112f");
+const INFINITY_SWAP_TOPIC: B256 =
+    b256!("0x04206ad2b7c0f463bff3dd4f33c5735b0f2957a351e4f79763a4fa9e775dd237");
 
 /// `Eth` pubsub RPC implementation.
 ///
@@ -65,7 +81,7 @@ where
             RpcConvert: RpcConvert<
                 Primitives: NodePrimitives<SignedTx = PoolConsensusTx<Eth::Pool>>,
             >,
-        >,
+        > + Call,
 {
     /// Returns the current sync status for the `syncing` subscription
     pub fn sync_status(&self, is_syncing: bool) -> PubSubSyncStatus {
@@ -90,7 +106,7 @@ where
     }
 
     /// Returns a stream that yields all logs that match the given filter.
-    pub fn log_stream(&self, filter: Filter) -> impl Stream<Item = Log> {
+    pub fn log_stream(&self, filter: Filter) -> impl Stream<Item = Vec<Log>> {
         self.inner.log_stream(filter)
     }
 
@@ -121,25 +137,20 @@ where
                     match params {
                         Params::Bool(true) => {
                             // full transaction objects requested
-                            let stream = self.full_pending_transaction_stream().filter_map(|tx| {
-                                let tx_value = match self
-                                    .inner
-                                    .eth_api
-                                    .tx_resp_builder()
-                                    .fill_pending(tx.transaction.to_consensus())
-                                {
-                                    Ok(tx) => Some(tx),
-                                    Err(err) => {
-                                        error!(target = "rpc",
-                                            %err,
-                                            "Failed to fill transaction with block context"
-                                        );
-                                        None
+                            let inner = self.inner.clone();
+                            let stream = self
+                                .full_pending_transaction_stream()
+                                .filter_map(move |tx| {
+                                    let inner = inner.clone();
+                                    async move {
+                                        inner
+                                            .simulate_tx(tx.transaction.to_consensus())
+                                            .await
+                                            .ok()?
                                     }
-                                };
-                                std::future::ready(tx_value)
-                            });
-                            return pipe_from_stream(accepted_sink, stream).await
+                                })
+                                .boxed();
+                            return pipe_from_stream(accepted_sink, stream).await;
                         }
                         Params::Bool(false) | Params::None => {
                             // only hashes requested
@@ -172,7 +183,7 @@ where
                 .map_err(SubscriptionSerializeError::new)?;
 
                 if accepted_sink.send(msg).await.is_err() {
-                    return Ok(())
+                    return Ok(());
                 }
 
                 while canon_state.next().await.is_some() {
@@ -192,7 +203,7 @@ where
                         .map_err(SubscriptionSerializeError::new)?;
 
                         if accepted_sink.send(msg).await.is_err() {
-                            break
+                            break;
                         }
                     }
                 }
@@ -214,7 +225,8 @@ where
             RpcConvert: RpcConvert<
                 Primitives: NodePrimitives<SignedTx = PoolConsensusTx<Eth::Pool>>,
             >,
-        > + 'static,
+        > + Call
+        + 'static,
 {
     /// Handler for `eth_subscribe`
     async fn subscribe(
@@ -369,13 +381,13 @@ where
     }
 
     /// Returns a stream that yields all logs that match the given filter.
-    fn log_stream(&self, filter: Filter) -> impl Stream<Item = Log> {
+    fn log_stream(&self, filter: Filter) -> impl Stream<Item = Vec<Log>> {
         BroadcastStream::new(self.eth_api.provider().subscribe_to_canonical_state())
             .map(move |canon_state| {
                 canon_state.expect("new block subscription never ends").block_receipts()
             })
             .flat_map(futures::stream::iter)
-            .flat_map(move |(block_receipts, removed)| {
+            .map(move |(block_receipts, removed)| {
                 let all_logs = logs_utils::matching_block_logs_with_tx_hashes(
                     &filter,
                     block_receipts.block,
@@ -383,7 +395,131 @@ where
                     block_receipts.tx_receipts.iter().map(|(tx, receipt)| (*tx, receipt)),
                     removed,
                 );
-                futures::stream::iter(all_logs)
+                // mev hack, filter logs to only keep the latest event per type
+                filter_logs(all_logs)
             })
     }
+}
+
+
+/// Structure representing simulated pending transaction with logs
+#[derive(Serialize)]
+struct SimulatedTransactionLogs<Tx> {
+    tx: Tx,
+    logs: Vec<Log>,
+}
+
+impl<Eth> EthPubSubInner<Eth>
+where
+    Eth: RpcNodeCore<Pool: TransactionPool>
+        + EthApiTypes<
+            RpcConvert: RpcConvert<
+                Primitives: NodePrimitives<SignedTx = PoolConsensusTx<Eth::Pool>>,
+            >,
+        > + Call,
+{
+    /// Executes the transaction in a call-style context and gathers the emitted logs, if any.
+    async fn simulate_tx_logs(
+        &self,
+        tx: Recovered<TxTy<Eth::Primitives>>,
+    ) -> Result<Option<Vec<Log>>, Eth::Error> {
+        let eth_api = self.eth_api.clone();
+        let tx_hash = *tx.tx_hash();
+
+        // Return early if the transaction has no input data or is EIP-4844
+        if tx.input().is_empty() || tx.is_eip4844() {
+            return Ok(None);
+        }
+
+        // Prepare EVM environment at latest block
+        let (mut evm_env, at) =
+            eth_api.evm_env_at(BlockId::Number(BlockNumberOrTag::Latest)).await?;
+        evm_env.block_env.timestamp += uint!(1_U256);
+
+        // Simulate the transaction
+        let tx_for_exec = tx.clone();
+        let logs = self
+            .eth_api
+            .clone()
+            .spawn_with_state_at_block(at, move |state| {
+                let db = CacheDB::new(StateProviderDatabase::new(state));
+                let mut evm = eth_api.evm_config().evm_with_env(db, evm_env);
+                let ResultAndState { result, .. } = evm
+                    .transact(eth_api.evm_config().tx_env(&tx_for_exec))
+                    .map_err(Eth::Error::from_evm_err)?;
+
+                let logs = match result {
+                    ExecutionResult::Success { logs, .. } => logs,
+                    other => {
+                        let _ = reth_rpc_eth_types::error::ensure_success::<_, Eth::Error>(other)?;
+                        unreachable!("ensure_success returns Err for non-success outcomes")
+                    }
+                };
+                Ok(logs)
+            })
+            .await?;
+
+        // Return early if no logs were emitted
+        if logs.is_empty() {
+            return Ok(None);
+        }
+
+        // Map the logs to RPC logs
+        let logs = logs
+            .into_iter()
+            .enumerate()
+            .map(|(index, log)| Log {
+                inner: log,
+                transaction_hash: Some(tx_hash),
+                transaction_index: None,
+                log_index: Some(index as u64),
+                removed: false,
+                block_hash: None,
+                block_number: None,
+                block_timestamp: None,
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+
+        Ok(Some(logs))
+    }
+
+    /// simulates a transaction to get logs
+    async fn simulate_tx(
+        &self,
+        tx: Recovered<TxTy<Eth::Primitives>>,
+    ) -> Result<Option<SimulatedTransactionLogs<RpcTransaction<Eth::NetworkTypes>>>, Eth::Error>
+    {
+        let rpc_tx = self.eth_api.tx_resp_builder().fill_pending(tx.clone())?;
+        let logs = match self.simulate_tx_logs(tx).await? {
+            Some(logs) => filter_logs(logs),
+            None => return Ok(None),
+        };
+        Ok(Some(SimulatedTransactionLogs { tx: rpc_tx, logs }))
+    }
+}
+
+/// filters logs to only keep the latest event per type.
+///
+/// this function assume logs are ordered from oldest to newest
+fn filter_logs(logs: Vec<Log>) -> Vec<Log> {
+    let mut latest: HashMap<(Address, Option<B256>, Option<B256>), Log> = HashMap::new();
+    for log in logs.into_iter() {
+        let topics = &log.inner.topics();
+        if topics.is_empty() {
+            continue;
+        }
+        let sig = topics[0];
+        let address = log.inner.address;
+        let key = match sig {
+            UNISWAP_V2_SYNC_TOPIC => (address, None, None),
+            UNISWAP_V3_SWAP_TOPIC | PANCAKE_V3_SWAP_TOPIC => (address, Some(sig), None),
+            UNISWAP_V4_SWAP_TOPIC | INFINITY_SWAP_TOPIC => {
+                (address, Some(sig), topics.get(1).copied())
+            }
+            _ => continue,
+        };
+        latest.insert(key, log);
+    }
+    latest.into_values().collect()
 }
