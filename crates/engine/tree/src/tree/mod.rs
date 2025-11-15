@@ -6,9 +6,9 @@ use crate::{
     tree::{error::InsertPayloadError, metrics::EngineApiMetrics, payload_validator::TreeCtx},
 };
 use alloy_consensus::BlockHeader;
-use alloy_eips::{eip1898::BlockWithParent, merge::EPOCH_SLOTS, BlockNumHash, NumHash};
+use alloy_eips::{eip1898::BlockWithParent, BlockNumHash, NumHash};
 use alloy_evm::block::StateChangeSource;
-use alloy_primitives::B256;
+use alloy_primitives::{B256, BlockHash, BlockNumber};
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
 };
@@ -40,6 +40,7 @@ use reth_stages_api::ControlFlow;
 use reth_trie::{HashedPostState, TrieInput};
 use reth_trie_db::DatabaseHashedPostState;
 use revm::state::EvmState;
+use revm_primitives::U256;
 use state::TreeState;
 use std::{
     fmt::Debug,
@@ -77,7 +78,7 @@ pub use invalid_headers::InvalidHeaderCache;
 pub use payload_processor::*;
 pub use payload_validator::{BasicEngineValidator, EngineValidator};
 pub use persistence_state::PersistenceState;
-pub use reth_engine_primitives::TreeConfig;
+pub use reth_engine_primitives::{TreeConfig, DEFAULT_MIN_BLOCKS_FOR_PIPELINE_RUN};
 use reth_trie::KeccakKeyHasher;
 
 pub mod state;
@@ -91,7 +92,11 @@ pub mod state;
 /// E.g.: Local head `block.number` is 100 and the forkchoice head `block.number` is 133 (more than
 /// an epoch has slots), then this exceeds the threshold at which the pipeline should be used to
 /// backfill this gap.
-pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = EPOCH_SLOTS;
+///
+/// This is kept for backwards compatibility with tests. Use `TreeConfig::min_blocks_for_pipeline_run()`
+/// for configurable threshold.
+#[cfg(test)]
+pub(crate) const MIN_BLOCKS_FOR_PIPELINE_RUN: u64 = DEFAULT_MIN_BLOCKS_FOR_PIPELINE_RUN;
 
 /// A builder for creating state providers that can be used across threads.
 #[derive(Clone, Debug)]
@@ -1347,6 +1352,16 @@ where
                                 // handle the event if any
                                 self.on_maybe_tree_event(maybe_event)?;
                             }
+                            BeaconEngineMessage::QueryTd { number, hash, tx } => {
+                                debug!(target: "engine::tree", number=?number, hash=?hash, "querying header and TD by engine message");
+                                let output = self.query_header_with_td(number, hash);
+
+                                if let Err(err) =
+                                    tx.send(output.map(|o| o.1).map_err(Into::into))
+                                {
+                                    error!(target: "engine::tree", "Failed to send event: {err:?}");
+                                }
+                            }
                         }
                     }
                 }
@@ -1936,8 +1951,8 @@ where
     ///
     /// If the `local_tip` is greater than the `block`, then this will return false.
     #[inline]
-    const fn exceeds_backfill_run_threshold(&self, local_tip: u64, block: u64) -> bool {
-        block > local_tip && block - local_tip > MIN_BLOCKS_FOR_PIPELINE_RUN
+    fn exceeds_backfill_run_threshold(&self, local_tip: u64, block: u64) -> bool {
+        block > local_tip && block - local_tip > self.config.min_blocks_for_pipeline_run()
     }
 
     /// Returns how far the local tip is from the given block. If the local tip is at the same
@@ -2792,6 +2807,64 @@ where
 
         debug!(target: "engine::tree", %hash, "no canonical state found for block");
         Ok(None)
+    }
+
+    /// Query the header and TD of the given block number and hash.
+    /// If the block is not found, the header and TD of the last block will be returned.
+    pub fn query_header_with_td(&self, number: BlockNumber, hash: BlockHash) -> ProviderResult<(N::BlockHeader, Option<U256>)> {
+        // query header td from canonical chain
+        if let Some(block_number) = self.provider.block_number(hash)? {
+            tracing::debug!(target: "engine::tree", number=?number, hash=?hash, "querying TD from canonical chain");
+            let header = self.provider.header_by_number(block_number)?.
+                ok_or(ProviderError::HeaderNotFound(block_number.into()))?;
+            let td = self.provider.header_td_by_number(block_number)?;
+            return Ok((header, td))
+        }
+        
+        // query header td from last block number
+        tracing::debug!(target: "engine::tree", number=?number, hash=?hash, "querying TD from fork headers");  
+        let mut ret_td = U256::ZERO;
+        let ret_header = self.state.tree_state.blocks_by_hash.get(&hash).
+            map(|b| b.block.recovered_block().clone_header()).
+            ok_or(ProviderError::HeaderNotFound(hash.into()))?;
+        ret_td = ret_td.wrapping_add(ret_header.difficulty());
+
+        let last_block_number = self.provider.last_block_number()?;
+        let (mut current_number, mut current_hash) = (number - 1, ret_header.parent_hash());
+        while current_number >= last_block_number {
+            match self.provider.block_number(current_hash)? {
+                Some(block_number) => {
+                    // add canonical chain td
+                    match self.provider.header_td_by_number(block_number)? {
+                        Some(td) => {
+                            ret_td = ret_td.wrapping_add(td);
+                            return Ok((ret_header, Some(ret_td)))
+                        }
+                        None => {
+                            tracing::warn!(target: "engine::tree", current_number=?current_number, current_hash=?current_hash, 
+                                "header td not found for block number, just return none");
+                            return Ok((ret_header, None))
+                        }
+                    }
+                }
+                None => {
+                    // continue to query forks
+                    let header = self.state.tree_state.blocks_by_hash.get(&current_hash).
+                        map(|b| b.block.recovered_block().header()).
+                        ok_or(ProviderError::HeaderNotFound(current_hash.into()))?;
+                    current_hash = header.parent_hash();
+                    ret_td = ret_td.wrapping_add(header.difficulty());
+                }
+            }
+            current_number -= 1;
+        }
+        
+        if current_number < last_block_number {
+            tracing::warn!(target: "engine::tree", current_number=?current_number, current_hash=?current_hash, last_block_number=?last_block_number,
+                 "cannot find header td for block number, query beyond last block number, just return none");
+            return Ok((ret_header, None))
+        }
+        Ok((ret_header, Some(ret_td)))
     }
 }
 
