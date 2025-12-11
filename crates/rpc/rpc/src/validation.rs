@@ -34,10 +34,11 @@ use reth_primitives_traits::{
 };
 use reth_revm::{cached::CachedReads, database::StateProviderDatabase};
 use reth_rpc_api::BlockSubmissionValidationApiServer;
-use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err};
+use reth_rpc_server_types::result::{internal_rpc_err, invalid_params_rpc_err, rpc_error_with_code};
 use reth_storage_api::{BlockReaderIdExt, StateProviderFactory};
 use reth_tasks::TaskSpawner;
 use revm_primitives::{Address, B256, U256};
+use rust_eth_triedb::triedb_manager::is_triedb_active;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{collections::HashSet, sync::Arc};
@@ -205,6 +206,10 @@ where
 
         self.ensure_payment(&block, &output, &message)?;
 
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateMessageAgainstBlock".to_string()).into());
+        }
+
         let state_root =
             state_provider.state_root(state_provider.hashed_post_state(&output.state))?;
 
@@ -348,6 +353,10 @@ where
         &self,
         mut blobs_bundle: BlobsBundleV1,
     ) -> Result<Vec<B256>, ValidationApiError> {
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateBlobsBundle".to_string()).into());
+        }
+
         if blobs_bundle.commitments.len() != blobs_bundle.proofs.len() ||
             blobs_bundle.commitments.len() != blobs_bundle.blobs.len()
         {
@@ -371,6 +380,9 @@ where
         &self,
         blobs_bundle: BlobsBundleV2,
     ) -> Result<Vec<B256>, ValidationApiError> {
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateBlobsBundleV2".to_string()).into());
+        }
         let versioned_hashes = blobs_bundle
             .commitments
             .iter()
@@ -390,6 +402,10 @@ where
         &self,
         request: BuilderBlockValidationRequestV3,
     ) -> Result<(), ValidationApiError> {
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateBuilderSubmissionV3".to_string()).into());
+        }
+
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
             payload: ExecutionPayload::V3(request.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v3(CancunPayloadFields {
@@ -411,6 +427,10 @@ where
         &self,
         request: BuilderBlockValidationRequestV4,
     ) -> Result<(), ValidationApiError> {
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateBuilderSubmissionV4".to_string()).into());
+        }
+
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
             payload: ExecutionPayload::V3(request.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v4(
@@ -439,6 +459,9 @@ where
         &self,
         request: BuilderBlockValidationRequestV5,
     ) -> Result<(), ValidationApiError> {
+        if is_triedb_active() {
+            return Err(ValidationApiError::MethodNotAvailable("validation_validateBuilderSubmissionV5".to_string()).into());
+        }
         let block = self.payload_validator.ensure_well_formed_payload(ExecutionData {
             payload: ExecutionPayload::V3(request.request.execution_payload),
             sidecar: ExecutionPayloadSidecar::v4(
@@ -490,6 +513,9 @@ where
         &self,
         _request: BuilderBlockValidationRequest,
     ) -> RpcResult<()> {
+        if is_triedb_active() {
+            return Err(rpc_error_with_code(-32601, "The method validation_validateBuilderSubmissionV1 does not exist/is not available"));
+        }
         warn!(target: "rpc::flashbots", "Method `flashbots_validateBuilderSubmissionV1` is not supported");
         Err(internal_rpc_err("unimplemented"))
     }
@@ -498,6 +524,9 @@ where
         &self,
         _request: BuilderBlockValidationRequestV2,
     ) -> RpcResult<()> {
+        if is_triedb_active() {
+            return Err(rpc_error_with_code(-32601, "The method validation_validateBuilderSubmissionV2 does not exist/is not available"));
+        }
         warn!(target: "rpc::flashbots", "Method `flashbots_validateBuilderSubmissionV2` is not supported");
         Err(internal_rpc_err("unimplemented"))
     }
@@ -507,6 +536,9 @@ where
         &self,
         request: BuilderBlockValidationRequestV3,
     ) -> RpcResult<()> {
+        if is_triedb_active() {
+            return Err(rpc_error_with_code(-32601, "The method validation_validateBuilderSubmissionV3 does not exist/is not available"));
+        }
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -525,6 +557,9 @@ where
         &self,
         request: BuilderBlockValidationRequestV4,
     ) -> RpcResult<()> {
+        if is_triedb_active() {
+            return Err(rpc_error_with_code(-32601, "The method validation_validateBuilderSubmissionV4 does not exist/is not available"));
+        }
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -543,6 +578,9 @@ where
         &self,
         request: BuilderBlockValidationRequestV5,
     ) -> RpcResult<()> {
+        if is_triedb_active() {
+            return Err(rpc_error_with_code(-32601, "The method validation_validateBuilderSubmissionV5 does not exist/is not available"));
+        }
         let this = self.clone();
         let (tx, rx) = oneshot::channel();
 
@@ -647,6 +685,8 @@ pub enum ValidationApiError {
     InvalidBlobsBundle,
     #[error("block accesses blacklisted address: {_0}")]
     Blacklist(Address),
+    #[error("The method {0} does not exist/is not available")]
+    MethodNotAvailable(String),
     #[error(transparent)]
     Blob(#[from] BlobTransactionValidationError),
     #[error(transparent)]
@@ -670,6 +710,9 @@ impl From<ValidationApiError> for ErrorObject<'static> {
             ValidationApiError::ProposerPayment |
             ValidationApiError::InvalidBlobsBundle |
             ValidationApiError::Blob(_) => invalid_params_rpc_err(error.to_string()),
+            ValidationApiError::MethodNotAvailable(method) => {
+                rpc_error_with_code(-32601, format!("The method {method} does not exist/is not available"))
+            }
 
             ValidationApiError::MissingLatestBlock |
             ValidationApiError::MissingParentBlock |
